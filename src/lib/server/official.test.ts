@@ -14,7 +14,7 @@ beforeEach(() => {
   vi.stubEnv("ER_API_KEY", "test-secret");
   vi.stubEnv("ER_DATA_SOURCE", "LIVE");
   vi.stubEnv("DATABASE_URL", "");
-  testTime += 60_000;
+  testTime += 24 * 60 * 60 * 1000;
   vi.spyOn(Date, "now").mockImplementation(() => (testTime += 1001));
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
@@ -72,7 +72,7 @@ describe("official API adapter", () => {
     expect(body).toMatchObject({ error: { code } });
     expect(JSON.stringify(body)).not.toContain("provider text");
     expect(JSON.stringify(body)).not.toContain("test-secret");
-    if (status === 429) { expect(response.headers.get("retry-after")).toBe("3600"); expect(body.error.retryAfterSeconds).toBe(3600); }
+    if (status === 429) { expect(response.headers.get("retry-after")).toBe("9999"); expect(body.error.retryAfterSeconds).toBe(9999); }
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
   it.each([

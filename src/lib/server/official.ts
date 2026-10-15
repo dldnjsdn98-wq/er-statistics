@@ -1,16 +1,10 @@
 import "server-only";
 import type { Character, PlayerGame, TimestampPolicy } from "../types";
 import { AppError } from "./errors";
+import { createRequestGate, retryAfterSeconds } from "./request-gate";
 
 const BASE = "https://open-api.bser.io";
-let requestQueue: Promise<void> = Promise.resolve();
-let lastCall = 0;
-
-function retryAfterSeconds(value: string | null): number {
-  if (!value) return 60;
-  const seconds = /^\d+$/.test(value.trim()) ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
-  return Number.isFinite(seconds) && seconds > 0 ? Math.min(Math.ceil(seconds), 3600) : 60;
-}
+const gate = createRequestGate();
 
 function upstreamError(code: number, retryAfter: string | null = null): AppError {
   if (code === 404) return new AppError("UPSTREAM_NOT_FOUND", 404, "공식 API가 요청한 조회 결과를 제공하지 않았습니다. 조회 대상의 존재 여부는 확인되지 않았습니다.");
@@ -34,21 +28,29 @@ function envelope(value: unknown, retryAfter: string | null = null): Record<stri
 async function officialGet(path: string): Promise<Record<string, unknown>> {
   const key = process.env.ER_API_KEY;
   if (!key) throw new AppError("LIVE_NOT_CONFIGURED", 503, "실제 API 키가 설정되지 않았습니다.");
-  const previous = requestQueue;
-  let unlock!: () => void;
-  requestQueue = new Promise<void>(resolve => { unlock = resolve; });
-  await previous;
-  try {
-    const delay = Math.max(0, 1000 - (Date.now() - lastCall));
-    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
-    lastCall = Date.now();
-    let response: Response;
-    try { response = await fetch(`${BASE}${path}`, { headers: { "x-api-key": key, Accept: "application/json" }, signal: AbortSignal.timeout(8000), cache: "no-store" }); }
-    catch (cause) { if (cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError")) throw new AppError("UPSTREAM_TIMEOUT", 504, "공식 API 응답 시간이 초과되었습니다."); throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API에 연결하지 못했습니다."); }
-    if (!response.ok) throw upstreamError(response.status, response.headers.get("retry-after"));
-    try { return envelope(await response.json(), response.headers.get("retry-after")); }
-    catch (error) { if (error instanceof AppError) throw error; throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 응답 형식이 올바르지 않습니다."); }
-  } finally { unlock(); }
+  return gate.run(async signal => {
+    try {
+      let response: Response;
+      try { response = await fetch(BASE + path, { headers: { "x-api-key": key, Accept: "application/json" }, signal, cache: "no-store" }); }
+      catch (cause) {
+        if (cause instanceof Error && ["TimeoutError", "AbortError"].includes(cause.name)) throw cause;
+        throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API에 연결하지 못했습니다.");
+      }
+      if (!response.ok) {
+        const error = upstreamError(response.status, response.headers.get("retry-after"));
+        void response.body?.cancel().catch(() => {});
+        throw error;
+      }
+      try { return envelope(await response.json(), response.headers.get("retry-after")); }
+      catch (cause) {
+        if (cause instanceof AppError || (cause instanceof Error && ["TimeoutError", "AbortError"].includes(cause.name))) throw cause;
+        throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 응답 형식이 올바르지 않습니다.");
+      }
+    } catch (cause) {
+      if (cause instanceof AppError && cause.code === "RATE_LIMITED") gate.block(cause.retryAfterSeconds ?? 60);
+      throw cause;
+    }
+  });
 }
 
 function object(value: unknown): Record<string, unknown> | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null; }
@@ -86,10 +88,10 @@ export function normalizeUserGames(value: unknown, uid: string, timeZone: string
   for (const row of rows) {
     const raw = object(row); const gameId = safeId(raw?.gameId), characterCode = positiveInt(raw?.characterNum);
     if (!raw || !gameId || !characterCode) { dropped++; continue; }
-    let startedAt: string;
-    try { const timestamp = parseOfficialTimestamp(raw.startDtm, timeZone); startedAt = timestamp.iso; if (timestamp.policy !== "explicit-offset") timestampPolicy = timestamp.policy; }
+    let startedAt: string; let rowPolicy: TimestampPolicy;
+    try { const timestamp = parseOfficialTimestamp(raw.startDtm, timeZone); startedAt = timestamp.iso; rowPolicy = timestamp.policy; if (timestamp.policy !== "explicit-offset") timestampPolicy = timestamp.policy; }
     catch (cause) { if (cause instanceof AppError) throw cause; dropped++; continue; }
-    games.push({ uid, gameId, startedAt, characterCode, matchingMode: optionalInteger(raw.matchingMode), rank: optionalInteger(raw.gameRank, 1), kills: optionalInteger(raw.playerKill), assists: optionalInteger(raw.playerAssistant), deaths: optionalInteger(raw.playerDeaths), damage: optionalNumber(raw.damageToPlayer), duration: optionalInteger(raw.playTime) });
+    games.push({ uid, gameId, startedAt, timestampPolicy: rowPolicy, characterCode, matchingMode: optionalInteger(raw.matchingMode), rank: optionalInteger(raw.gameRank, 1), kills: optionalInteger(raw.playerKill), assists: optionalInteger(raw.playerAssistant), deaths: optionalInteger(raw.playerDeaths), damage: optionalNumber(raw.damageToPlayer), duration: optionalInteger(raw.playTime) });
   }
   return { games, dropped, timestampPolicy };
 }
