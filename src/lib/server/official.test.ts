@@ -146,3 +146,22 @@ describe("official API adapter", () => {
     await expect(fetchUserGames("abc", undefined)).rejects.toMatchObject({ code: "UPSTREAM_TIMEOUT" });
   });
 });
+
+describe("transport edge cases", () => {
+  it("keeps a response-body timeout classified as a timeout", async () => {
+    const response = new Response("", { status: 200 });
+    vi.spyOn(response, "json").mockRejectedValue(new DOMException("body timeout", "TimeoutError"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    await expect(resolvePlayer("body-timeout-fixture")).rejects.toMatchObject({ code: "UPSTREAM_TIMEOUT", status: 504 });
+  });
+  it("encodes special nickname characters exactly once", async () => {
+    const nickname = "한글 +&?#%";
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ code: 200, user: { uid: "safe-fixture", nickname } }));
+    vi.stubGlobal("fetch", fetcher);
+    await resolvePlayer(nickname);
+    const url = new URL(fetcher.mock.calls[0][0] as string);
+    expect(url.searchParams.get("query")).toBe(nickname);
+    expect([...url.searchParams.keys()]).toEqual(["query"]);
+    expect(url.hash).toBe("");
+  });
+});

@@ -64,7 +64,7 @@ const postgres: Repository = {
   kind: "postgres",
   async findPlayer(nickname) { try { const result = await getPool().query("SELECT uid,nickname FROM players WHERE nickname=$1 ORDER BY last_seen_at DESC LIMIT 1", [nickname]); return result.rows[0] ?? null; } catch { throw dbError(); } },
   async getGames(uid) { try { const result = await getPool().query("SELECT uid,game_id,started_at,character_code,matching_mode,game_rank,kills,assists,deaths,damage_to_player,play_time_seconds,timestamp_policy FROM player_games WHERE uid=$1", [uid]); return result.rows.map(rowToGame); } catch { throw dbError(); } },
-  async getSync(uid) { try { const result = await getPool().query("SELECT finished_at,dropped_records,timestamp_policy FROM sync_runs WHERE uid=$1 AND status='success' ORDER BY finished_at DESC LIMIT 1", [uid]); const row = result.rows[0]; return row ? { lastSyncedAt: new Date(row.finished_at).toISOString(), droppedRecords: Number(row.dropped_records), timestampPolicy: row.timestamp_policy as TimestampPolicy } : null; } catch { throw dbError(); } },
+  async getSync(uid) { try { const result = await getPool().query("SELECT finished_at,dropped_records,timestamp_policy FROM sync_runs WHERE uid=$1 AND status='success' ORDER BY finished_at DESC,id DESC LIMIT 1", [uid]); const row = result.rows[0]; return row ? { lastSyncedAt: new Date(row.finished_at).toISOString(), droppedRecords: Number(row.dropped_records), timestampPolicy: row.timestamp_policy as TimestampPolicy } : null; } catch { throw dbError(); } },
   async upsert(player, games, info) {
     let client; try { client = await getPool().connect(); await client.query("BEGIN");
       await client.query("INSERT INTO players(uid,nickname) VALUES($1,$2) ON CONFLICT(uid) DO UPDATE SET nickname=EXCLUDED.nickname,last_seen_at=now()", [player.uid, player.nickname]);
@@ -86,3 +86,5 @@ const postgres: Repository = {
 };
 
 export function repository(): Repository { return process.env.DATABASE_URL ? postgres : memory; }
+
+export async function closeRepository(): Promise<void> { const current = pool; pool = null; if (current) await current.end(); }
