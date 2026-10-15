@@ -43,7 +43,12 @@ export function createRequestGate(options: { spacingMs?: number; requestMs?: num
         lastCall = Date.now();
         const controller = new AbortController();
         try {
-          return await limited(Promise.resolve().then(() => work(controller.signal)), Math.min(requestMs, expires - Date.now()), () => controller.abort());
+          const remaining = Math.min(requestMs, expires - Date.now());
+          if (remaining <= 0) throw timeoutError();
+          return await limited(Promise.resolve().then(() => {
+            if (controller.signal.aborted || Date.now() >= expires) throw timeoutError();
+            return work(controller.signal);
+          }), remaining, () => controller.abort());
         } catch (cause) {
           if (cause instanceof Error && ["TimeoutError", "AbortError"].includes(cause.name)) throw timeoutError();
           throw cause;

@@ -3,7 +3,7 @@ vi.mock("server-only", () => ({}));
 import { createRequestGate, retryAfterSeconds } from "./request-gate";
 
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-15T00:00:00Z")); });
-afterEach(() => { vi.useRealTimers(); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 describe("request limits", () => {
   it("preserves long seconds and HTTP dates without retrying early", () => {
     expect(retryAfterSeconds("9999")).toBe(9999);
@@ -57,4 +57,15 @@ describe("request limits", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(await second).toMatchObject({ code: "UPSTREAM_TIMEOUT", status: 504 });
   });
+});
+
+it("does not start work if the deadline expires between admission and dispatch", async () => {
+  const start = Date.now();
+  let reads = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => start + (++reads >= 8 ? 2 : 0));
+  const gate = createRequestGate({ spacingMs: 0, totalMs: 1 });
+  const work = vi.fn(async () => "too late");
+  await expect(gate.run(work)).rejects.toMatchObject({ code: "UPSTREAM_TIMEOUT" });
+  await Promise.resolve();
+  expect(work).not.toHaveBeenCalled();
 });
