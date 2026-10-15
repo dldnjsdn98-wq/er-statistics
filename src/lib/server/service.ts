@@ -34,7 +34,6 @@ async function getPlayer(nickname: string, repo: ReturnType<typeof repository>):
   if (cached && Date.now() - cached.at < 60000) return { player: cached.player, stale: false };
   try { const player = await resolvePlayer(nickname); playerCache.set(nickname, { at: Date.now(), player }); return { player, stale: false }; }
   catch (error) {
-    if (error instanceof AppError && error.code === "PLAYER_NOT_FOUND") throw error;
     const stored = cached?.player ?? await repo.findPlayer(nickname);
     if (stored) return { player: stored, stale: true };
     throw error;

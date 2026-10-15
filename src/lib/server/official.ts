@@ -6,7 +6,32 @@ const BASE = "https://open-api.bser.io";
 let requestQueue: Promise<void> = Promise.resolve();
 let lastCall = 0;
 
-async function officialGet(path: string): Promise<unknown> {
+function retryAfterSeconds(value: string | null): number {
+  if (!value) return 60;
+  const seconds = /^\d+$/.test(value.trim()) ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
+  return Number.isFinite(seconds) && seconds > 0 ? Math.min(Math.ceil(seconds), 3600) : 60;
+}
+
+function upstreamError(code: number, retryAfter: string | null = null): AppError {
+  if (code === 404) return new AppError("UPSTREAM_NOT_FOUND", 404, "공식 API가 요청한 조회 결과를 제공하지 않았습니다. 조회 대상의 존재 여부는 확인되지 않았습니다.");
+  if (code === 403) return new AppError("UPSTREAM_FORBIDDEN", 502, "공식 API가 요청을 허용하지 않았습니다. 접근 권한 또는 요청 제한을 확인해 주세요.");
+  if (code === 429) return new AppError("RATE_LIMITED", 429, "공식 API 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.", retryAfterSeconds(retryAfter));
+  if (code === 401) return new AppError("UPSTREAM_AUTH_FAILED", 502, "공식 API 인증에 실패했습니다. 서버 설정을 확인해 주세요.");
+  return new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API가 요청을 처리하지 못했습니다.");
+}
+
+function envelope(value: unknown, retryAfter: string | null = null): Record<string, unknown> {
+  const result = object(value);
+  if (!result) throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 응답 형식이 올바르지 않습니다.");
+  if (Object.hasOwn(result, "code")) {
+    if (typeof result.code !== "number" || !Number.isInteger(result.code)) throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 응답 형식이 올바르지 않습니다.");
+    if (result.code !== 0 && result.code !== 200) throw upstreamError(result.code, retryAfter);
+  }
+  if (result.error) throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 응답 형식이 올바르지 않습니다.");
+  return result;
+}
+
+async function officialGet(path: string): Promise<Record<string, unknown>> {
   const key = process.env.ER_API_KEY;
   if (!key) throw new AppError("LIVE_NOT_CONFIGURED", 503, "실제 API 키가 설정되지 않았습니다.");
   const previous = requestQueue;
@@ -20,11 +45,9 @@ async function officialGet(path: string): Promise<unknown> {
     let response: Response;
     try { response = await fetch(`${BASE}${path}`, { headers: { "x-api-key": key, Accept: "application/json" }, signal: AbortSignal.timeout(8000), cache: "no-store" }); }
     catch (cause) { if (cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError")) throw new AppError("UPSTREAM_TIMEOUT", 504, "공식 API 응답 시간이 초과되었습니다."); throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API에 연결하지 못했습니다."); }
-    if (response.status === 404) throw new AppError("PLAYER_NOT_FOUND", 404, "닉네임에 해당하는 플레이어를 찾지 못했습니다.");
-    if (response.status === 429) { const retry = Number(response.headers.get("retry-after")); throw new AppError("RATE_LIMITED", 429, "공식 API 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.", Number.isFinite(retry) && retry > 0 ? Math.min(retry, 3600) : 60); }
-    if (response.status === 401 || response.status === 403) throw new AppError("UPSTREAM_AUTH_FAILED", 502, "공식 API 인증에 실패했습니다. 서버 설정을 확인해 주세요.");
-    if (!response.ok) throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API가 전적을 제공하지 못했습니다.");
-    try { return await response.json(); } catch { throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API 응답 형식이 올바르지 않습니다."); }
+    if (!response.ok) throw upstreamError(response.status, response.headers.get("retry-after"));
+    try { return envelope(await response.json(), response.headers.get("retry-after")); }
+    catch (error) { if (error instanceof AppError) throw error; throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 응답 형식이 올바르지 않습니다."); }
   } finally { unlock(); }
 }
 
@@ -57,9 +80,8 @@ export function parseOfficialTimestamp(value: unknown, timeZone: string | undefi
 }
 
 export function normalizeUserGames(value: unknown, uid: string, timeZone: string | undefined): { games: PlayerGame[]; dropped: number; timestampPolicy: TimestampPolicy } {
-  const envelope = object(value), rows = envelope?.userGames;
-  if (envelope?.error || (typeof envelope?.code === "number" && envelope.code !== 0 && envelope.code !== 200)) throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API 오류 응답을 받았습니다.");
-  if (!Array.isArray(rows)) throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 게임 응답 형식이 올바르지 않습니다.");
+  const rows = envelope(value).userGames;
+  if (!Array.isArray(rows)) throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 게임 응답 형식이 올바르지 않습니다.");
   const games: PlayerGame[] = []; let dropped = 0; let timestampPolicy: TimestampPolicy = "explicit-offset";
   for (const row of rows) {
     const raw = object(row); const gameId = safeId(raw?.gameId), characterCode = positiveInt(raw?.characterNum);
@@ -73,19 +95,18 @@ export function normalizeUserGames(value: unknown, uid: string, timeZone: string
 }
 
 export async function resolvePlayer(nickname: string): Promise<{ uid: string; nickname: string }> {
-  const value = object(await officialGet(`/v1/user/nickname?${new URLSearchParams({ query: nickname })}`));
-  if (value?.error || (typeof value?.code === "number" && value.code !== 0 && value.code !== 200)) throw new AppError("UPSTREAM_UNAVAILABLE", 502, "공식 API 오류 응답을 받았습니다.");
+  const value = await officialGet(`/v1/user/nickname?${new URLSearchParams({ query: nickname })}`);
   const user = object(value?.user), uid = safeUid(user?.uid), name = user?.nickname;
-  if (!uid || typeof name !== "string" || !name.trim()) throw new AppError("PLAYER_NOT_FOUND", 404, "닉네임에 해당하는 플레이어를 찾지 못했습니다.");
+  if (!uid || typeof name !== "string" || !name.trim()) throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "공식 API 사용자 응답 형식이 올바르지 않습니다.");
   return { uid, nickname: name };
 }
 
 export async function fetchUserGames(uid: string, timeZone: string | undefined) { return normalizeUserGames(await officialGet(`/v1/user/games/uid/${encodeURIComponent(uid)}`), uid, timeZone); }
 
 export async function fetchCharacters(): Promise<Character[]> {
-  const value = object(await officialGet("/v2/data/Character"));
+  const value = await officialGet("/v2/data/Character");
   const rows = value?.data;
-  if (!Array.isArray(rows)) throw new AppError("UPSTREAM_UNAVAILABLE", 502, "실험체 메타데이터 형식이 올바르지 않습니다.");
+  if (!Array.isArray(rows)) throw new AppError("UPSTREAM_INVALID_RESPONSE", 502, "실험체 메타데이터 형식이 올바르지 않습니다.");
   const characters: Character[] = [];
   for (const row of rows) { const item = object(row), code = positiveInt(item?.code ?? item?.characterNum); if (code) characters.push({ code, name: typeof item?.name === "string" && item.name ? item.name : `캐릭터 ${code}` }); }
   return [...new Map(characters.map(character => [character.code, character])).values()].sort((a, b) => a.code - b.code);

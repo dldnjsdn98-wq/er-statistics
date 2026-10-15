@@ -1,0 +1,14 @@
+{
+  "provenance": "Reconstructed from previous chat tool output on 2026-10-15; not a raw HTTP capture. Request time was not recorded.",
+  "request": {
+    "method": "GET",
+    "url": "https://open-api.bser.io/v1/user/nickname?query=toprain"
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "code": 404,
+      "message": "Not Found"
+    }
+  }
+}

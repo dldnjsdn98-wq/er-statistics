@@ -56,6 +56,12 @@ type StatsResponse = {
     warnings: Array<{ code: string; message: string }>;
   };
   summary: MetricSummary;
+  trend: Array<{
+    date: string; // YYYY-MM-DD, KST
+    games: number; wins: number;
+    winRate: number | null; averageRank: number | null;
+    rankSamples: number;
+  }>;
   characters: Array<MetricSummary & { code: number; name: string }>;
   matches: Array<{
     gameId: string; startedAt: string;
@@ -71,6 +77,8 @@ type StatsResponse = {
 `complete`는 요청 기간 전체의 수집 완료를 입증한 경우만 가능하며 초기 live 어댑터는 반환하지 않는다. `demo`는 샘플일 뿐 실제 계정의 수집 완료를 뜻하지 않는다. timestampPolicy는 원본에 오프셋이 없는 행이 하나라도 있으면 설정 기반 정책을 반환한다. warnings 예시는 `PARTIAL_HISTORY`, `NICKNAME_UID_LIMITATION`, `STALE_DATA`, `OUTSIDE_API_RETENTION`, `EPHEMERAL_STORAGE`, `DROPPED_RECORDS`, `TIMESTAMP_ASSUMPTION`이다. 오류가 발생해도 cached live를 반환할 경우 HTTP 200과 stale 경고를 함께 보낸다.
 
 캐릭터 행은 경기 수 내림차순, 동률 code 오름차순이다. 명시 선택된 캐릭터는 경기가 없어도 모두 행을 반환한다. 페이지 번호가 결과 범위를 넘어가면 matches=[], 기존 summary/characters/total을 유지한다. 전체 0건일 때 totalPages=0이다. stats 응답은 `Cache-Control: no-store`를 권장하고 상위 API 호출 캐시는 서버에서 관리한다.
+
+`trend`는 중복 제거와 날짜·모드·복수 실험체 필터를 모두 적용한 뒤, `matches` 페이지를 자르기 전에 한국 시간 날짜별로 집계한다. 경기가 있는 날짜만 오름차순으로 반환하며 빈 날짜는 0% 행을 만들지 않는다. 순위가 유효한 경기만 `rankSamples`, 승률의 분모, 평균 순위에 포함한다. 순위 표본이 없으면 `winRate`와 `averageRank`는 `null`이다. 이 일별 API 데이터는 그대로 유지한다. 화면은 요청한 전체 날짜 범위를 최대 7개의 연속된 달력 날짜 구간으로 요약한다. 구간 승률은 승리 합계/유효 순위 표본 합계, 구간 평균 순위는 각 날짜의 평균 순위에 표본 수를 곱한 합계/표본 합계다. 빈 구간이나 순위 표본이 없는 구간은 `null` 수치로 보여주며 선으로 연결하지 않는다.
 
 ## 오류 계약
 
@@ -88,12 +96,14 @@ type StatsResponse = {
 | HTTP | code | 의미 |
 | --- | --- | --- |
 | 400 | INVALID_QUERY | 입력 검증 실패 |
-| 404 | PLAYER_NOT_FOUND | 닉네임 조회 결과 없음 |
+| 404 | UPSTREAM_NOT_FOUND | 공식 API가 조회 결과를 제공하지 않음; 플레이어 또는 조회 대상의 존재 여부는 미확인 |
 | 429 | RATE_LIMITED | 로컬/공식 요청 한도, 가능한 경우 Retry-After 응답 헤더 |
 | 503 | LIVE_NOT_CONFIGURED | live인데 키가 없음 |
 | 503 | UPSTREAM_TIMEZONE_REQUIRED | 시간대 없는 원본 시각을 안전하게 해석할 설정 없음 |
-| 502 | UPSTREAM_AUTH_FAILED | 공식 키 인증 실패, 비밀값은 노출하지 않음 |
-| 502 | UPSTREAM_UNAVAILABLE | 외부 오류 또는 계약에 맞지 않는 응답 |
+| 502 | UPSTREAM_AUTH_FAILED | 공식 API가 401을 반환함; 비밀값은 노출하지 않음 |
+| 502 | UPSTREAM_FORBIDDEN | 공식 API가 403을 반환함; 권한 또는 요청 제한 사유는 미확인 |
+| 502 | UPSTREAM_INVALID_RESPONSE | JSON·응답 envelope·UID 등 필수 필드가 유효하지 않음 |
+| 502 | UPSTREAM_UNAVAILABLE | 그 밖의 공식 API 오류 또는 연결 실패 |
 | 504 | UPSTREAM_TIMEOUT | 외부 시간 초과 |
 | 503 | STORAGE_UNAVAILABLE | 설정된 DB 연결 실패; 조용한 메모리 전환 금지 |
 

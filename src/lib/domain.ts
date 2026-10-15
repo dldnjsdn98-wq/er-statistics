@@ -1,4 +1,4 @@
-import type { Character, MatchMode, MetricSummary, PlayerGame, Query, StatsResponse } from "./types";
+import type { Character, DailyTrendPoint, MatchMode, MetricSummary, PlayerGame, Query, StatsResponse } from "./types";
 export class QueryError extends Error { constructor(message: string, public fields: Record<string, string> = {}) { super(message); } }
 export function dateMs(date: string): number {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new QueryError("날짜는 YYYY-MM-DD 형식이어야 합니다.");
@@ -32,8 +32,8 @@ export function parseQuery(params: URLSearchParams): Query {
 export function modeOf(game: PlayerGame): "normal" | "ranked" | "unknown" { return game.matchingMode === 2 ? "normal" : game.matchingMode === 3 ? "ranked" : "unknown"; }
 export function deduplicate(games: PlayerGame[]): PlayerGame[] { const seen = new Set<string>(); return games.filter(game => { const key = `${game.uid}\u0000${game.gameId}`; if (seen.has(key)) return false; seen.add(key); return true; }); }
 export function filterGames(games: PlayerGame[], query: Query): PlayerGame[] {
-  const { startInclusive, endExclusive } = kstBounds(query.startDate, query.endDate), selected = new Set(query.characterCodes);
-  return deduplicate(games).filter(game => game.startedAt >= startInclusive && game.startedAt < endExclusive && (query.mode === "all" || modeOf(game) === query.mode) && (!selected.size || selected.has(game.characterCode))).sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.gameId.localeCompare(a.gameId));
+  const { startInclusive, endExclusive } = kstBounds(query.startDate, query.endDate), start = Date.parse(startInclusive), end = Date.parse(endExclusive), selected = new Set(query.characterCodes);
+  return deduplicate(games).filter(game => { const time = Date.parse(game.startedAt); return Number.isFinite(time) && time >= start && time < end && (query.mode === "all" || modeOf(game) === query.mode) && (!selected.size || selected.has(game.characterCode)); }).sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.gameId.localeCompare(a.gameId));
 }
 function valid(n: number | null): n is number { return n !== null && Number.isFinite(n) && n >= 0; }
 function average(values: Array<number | null>): [number | null, number] { const found = values.filter(valid); return [found.length ? found.reduce((sum, value) => sum + value, 0) / found.length : null, found.length]; }
@@ -43,11 +43,24 @@ export function summarize(games: PlayerGame[]): MetricSummary {
   const wins = ranks.filter(value => value === 1).length;
   return { games: games.length, wins, winRate: rankCount ? wins / rankCount * 100 : null, averageRank, averageKills, averageAssists, averageDamage, metricCounts: { rank: rankCount, kills: killsCount, assists: assistsCount, damage: damageCount } };
 }
+export function dailyTrend(games: PlayerGame[]): DailyTrendPoint[] {
+  const days = new Map<string, PlayerGame[]>();
+  for (const game of games) {
+    const date = new Date(Date.parse(game.startedAt) + 9 * 3600000).toISOString().slice(0, 10);
+    const day = days.get(date) ?? [];
+    day.push(game);
+    days.set(date, day);
+  }
+  return [...days].sort(([a], [b]) => a.localeCompare(b)).map(([date, day]) => {
+    const { games, wins, winRate, averageRank, metricCounts } = summarize(day);
+    return { date, games, wins, winRate, averageRank, rankSamples: metricCounts.rank };
+  });
+}
 export function buildStats(input: { query: Query; games: PlayerGame[]; characters: Character[]; source: "demo" | "live"; storage: "fixture" | "memory" | "postgres"; player: { uid: string; nickname: string }; coverage: StatsResponse["coverage"] }): StatsResponse {
   const { query, games, characters, source, storage, player, coverage } = input, chosen = filterGames(games, query), names = new Map(characters.map(character => [character.code, character.name]));
   const codes = query.characterCodes.length ? query.characterCodes : [...new Set(chosen.map(game => game.characterCode))];
   const characterRows = codes.map(code => ({ code, name: names.get(code) ?? `캐릭터 ${code}`, ...summarize(chosen.filter(game => game.characterCode === code)) })).sort((a, b) => b.games - a.games || a.code - b.code);
   const start = (query.page - 1) * query.pageSize;
   const matches = chosen.slice(start, start + query.pageSize).map(game => ({ gameId: game.gameId, startedAt: game.startedAt, characterCode: game.characterCode, characterName: names.get(game.characterCode) ?? `캐릭터 ${game.characterCode}`, mode: modeOf(game), rank: game.rank, kills: game.kills, assists: game.assists, damage: game.damage }));
-  return { source, storage, player, filters: { startDate: query.startDate, endDate: query.endDate, timeZone: "Asia/Seoul", ...kstBounds(query.startDate, query.endDate), characterCodes: query.characterCodes, mode: query.mode }, coverage, summary: summarize(chosen), characters: characterRows, matches, pagination: { page: query.page, pageSize: query.pageSize, total: chosen.length, totalPages: Math.ceil(chosen.length / query.pageSize) } };
+  return { source, storage, player, filters: { startDate: query.startDate, endDate: query.endDate, timeZone: "Asia/Seoul", ...kstBounds(query.startDate, query.endDate), characterCodes: query.characterCodes, mode: query.mode }, coverage, summary: summarize(chosen), trend: dailyTrend(chosen), characters: characterRows, matches, pagination: { page: query.page, pageSize: query.pageSize, total: chosen.length, totalPages: Math.ceil(chosen.length / query.pageSize) } };
 }
