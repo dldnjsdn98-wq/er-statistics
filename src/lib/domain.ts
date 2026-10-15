@@ -30,7 +30,26 @@ export function parseQuery(params: URLSearchParams): Query {
   return { nickname, startDate, endDate, mode: mode as MatchMode, characterCodes: [...new Set(codeStrings.map(Number))].sort((a, b) => a - b), page: integerParam(params.get("page"), 1, 100000000, "page"), pageSize: integerParam(params.get("pageSize"), 20, 100, "pageSize") };
 }
 export function modeOf(game: PlayerGame): "normal" | "ranked" | "unknown" { return game.matchingMode === 2 ? "normal" : game.matchingMode === 3 ? "ranked" : "unknown"; }
-export function deduplicate(games: PlayerGame[]): PlayerGame[] { const seen = new Set<string>(); return games.filter(game => { const key = `${game.uid}\u0000${game.gameId}`; if (seen.has(key)) return false; seen.add(key); return true; }); }
+// Merge missing measurements only when both rows describe the same observation.
+// Conflicting time/character identities keep the first row; never mix two matches.
+export function mergeDuplicate(first: PlayerGame, later: PlayerGame): PlayerGame {
+  if (first.uid !== later.uid || first.gameId !== later.gameId || first.startedAt !== later.startedAt || first.characterCode !== later.characterCode ||
+      (first.matchingMode !== null && later.matchingMode !== null && first.matchingMode !== later.matchingMode)) return { ...first };
+  const merged = { ...first };
+  for (const key of ["matchingMode", "rank", "kills", "assists", "deaths", "damage", "duration"] as const) {
+    if (merged[key] === null && later[key] !== null && Number.isFinite(later[key]) && later[key]! >= 0) merged[key] = later[key];
+  }
+  return merged;
+}
+export function deduplicate(games: PlayerGame[]): PlayerGame[] {
+  const found = new Map<string, PlayerGame>();
+  for (const game of games) {
+    const key = game.uid + "\u0000" + game.gameId, first = found.get(key);
+    found.set(key, first ? mergeDuplicate(first, game) : { ...game });
+  }
+  return [...found.values()];
+}
+
 export function filterGames(games: PlayerGame[], query: Query): PlayerGame[] {
   const { startInclusive, endExclusive } = kstBounds(query.startDate, query.endDate), start = Date.parse(startInclusive), end = Date.parse(endExclusive), selected = new Set(query.characterCodes);
   return deduplicate(games).filter(game => { const time = Date.parse(game.startedAt); return Number.isFinite(time) && time >= start && time < end && (query.mode === "all" || modeOf(game) === query.mode) && (!selected.size || selected.has(game.characterCode)); }).sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.gameId.localeCompare(a.gameId));

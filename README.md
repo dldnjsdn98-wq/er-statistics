@@ -40,10 +40,11 @@ NODE_USE_ENV_PROXY=1 npm run start
 
 ## PostgreSQL 저장 (선택)
 
-라이브 모드에서 `DATABASE_URL`을 설정하기 전에 [db/001_init.sql](db/001_init.sql)을 데이터베이스에 적용하세요.
+라이브 모드에서 `DATABASE_URL`을 설정하기 전에 [db/001_init.sql](db/001_init.sql)을 데이터베이스에 적용하고, 이어서 [db/002_timestamp_policy.sql](db/002_timestamp_policy.sql)을 적용하세요.
 
 ```bash
 psql "$DATABASE_URL" -f db/001_init.sql
+psql "$DATABASE_URL" -f db/002_timestamp_policy.sql
 ```
 
 `DATABASE_URL`이 없으면 라이브 결과는 프로세스 메모리에 보관되고 재시작 시 사라집니다. API 응답은 이 상태를 표시합니다. DB 연결이 실패하면 메모리로 조용히 전환하지 않고 `STORAGE_UNAVAILABLE` 오류를 반환합니다. 이미 저장된 실제 전적이 있을 때 일시적인 공식 API 실패가 발생하면 출처는 계속 `live`로 두고 마지막 수집 시각과 `stale` 경고를 표시합니다. 데모 데이터는 PostgreSQL에 저장하지 않습니다.
@@ -70,3 +71,5 @@ npm run build
 ```
 
 테스트는 한국 시간 날짜 경계, 다중 실험체 OR와 기간·모드 AND, 중복 게임, 0경기 행, 결측 수치, 페이지 구분, API 응답 정규화와 오류를 검증합니다. PostgreSQL 통합과 실제 플레이어 전적 조회는 별도 연결 환경에서 확인해야 합니다. [설계](docs/architecture.md)와 [연결 체크 목록](docs/acceptance.md)을 참고하세요.
+
+요청 제한·캐시 장애 표시·경기별 시각 정책·메모리 및 동기화 로그 보존 정책은 [API 복구 및 보존 정책](docs/api-resilience.md)을 참고하세요. 새 마이그레이션은 PostgreSQL 사용 시 배포 전에 적용해야 합니다.

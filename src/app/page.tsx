@@ -28,6 +28,8 @@ export default function Home() {
   const [source, setSource] = useState<Source | null>(null);
   const [data, setData] = useState<StatsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryAt, setRetryAt] = useState<string | null>(null);
+  const [metadataNotice, setMetadataNotice] = useState("");
   const [loading, setLoading] = useState(false);
   const [characterSearch, setCharacterSearch] = useState("");
   const [manualCode, setManualCode] = useState("");
@@ -40,6 +42,7 @@ export default function Home() {
   const characterControlRef = useRef<HTMLDivElement>(null);
   const characterTriggerRef = useRef<HTMLButtonElement>(null);
   const requestSeq = useRef(0);
+  const statsController = useRef<AbortController | null>(null);
   const recentRef = useRef<SearchConditions[]>([]);
   const allCharacters = useMemo(() => [...new Map([...characters, ...(data?.characters ?? []).map(character => ({ code: character.code, name: character.name }))].map(character => [character.code, character])).values()], [characters, data]);
   const visibleCharacters = useMemo(() => allCharacters.filter(character => character.name.toLowerCase().includes(characterSearch.toLowerCase()) || String(character.code).includes(characterSearch)).slice(0, 100), [allCharacters, characterSearch]);
@@ -52,16 +55,22 @@ export default function Home() {
   async function loadStats(search: Search, updateUrl = false, explicitAnalysis = false) {
     let parsed: Query;
     try { parsed = parseQuery(queryParams(search)); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : "검색 조건이 올바르지 않습니다."); return; }
+    catch (cause) { ++requestSeq.current; statsController.current?.abort(); setLoading(false); setRetryAt(null); setError(cause instanceof Error ? cause.message : "검색 조건이 올바르지 않습니다."); return; }
     const sequence = ++requestSeq.current;
-    setLoading(true); setError(null); setData(null);
+    statsController.current?.abort();
+    const controller = new AbortController(); statsController.current = controller;
+    setLoading(true); setError(null); setData(null); setRetryAt(null);
     setShareStatus(""); setShareFallback("");
     const params = queryParams(parsed);
     if (updateUrl) window.history.replaceState(null, "", `?${params}`);
     try {
-      const response = await fetch(`/api/stats?${params}`, { cache: "no-store" });
+      const response = await fetch(`/api/stats?${params}`, { cache: "no-store", signal: controller.signal });
       const body = await response.json();
-      if (!response.ok) throw new Error(typeof body.error?.message === "string" ? body.error.message : "잠시 후 다시 시도해 주세요.");
+      if (!response.ok) {
+        const seconds = body.error?.retryAfterSeconds;
+        if (sequence === requestSeq.current && typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0 && seconds < 8640000000000) setRetryAt(new Date(Date.now() + seconds * 1000).toISOString());
+        throw new Error(typeof body.error?.message === "string" ? body.error.message : "잠시 후 다시 시도해 주세요.");
+      }
       if (sequence === requestSeq.current) {
         setData(body as StatsResponse); setSource(body.source as Source); setAppliedSearch(parsed);
         setShareStatus(""); setShareFallback("");
@@ -72,12 +81,19 @@ export default function Home() {
         }
       }
     } catch (cause) {
-      if (sequence === requestSeq.current) setError(cause instanceof Error ? cause.message : "잠시 후 다시 시도해 주세요.");
+      if (sequence === requestSeq.current && !controller.signal.aborted) setError(cause instanceof Error ? cause.message : "잠시 후 다시 시도해 주세요.");
     } finally { if (sequence === requestSeq.current) setLoading(false); }
   }
 
   useEffect(() => {
-    fetch("/api/characters").then(async response => { const body = await response.json(); if (!response.ok) throw new Error(body.error?.message ?? "실험체 목록 오류"); return body; }).then(body => { setCharacters(body.characters as Character[]); setSource(body.source as Source); }).catch(() => setCharacters([]));
+    const metadataController = new AbortController();
+    fetch("/api/characters", { signal: metadataController.signal, cache: "no-store" }).then(async response => {
+      const body = await response.json(); if (!response.ok) throw new Error("실험체 목록 오류"); return body;
+    }).then(body => {
+      if (metadataController.signal.aborted) return;
+      setCharacters(body.characters as Character[]); setSource(body.source as Source);
+      setMetadataNotice(body.status === "unavailable" ? "실험체 목록을 불러오지 못했습니다. 코드로 직접 선택할 수 있습니다." : body.status === "stale" ? "실험체 목록 갱신에 실패해 이전 이름 정보를 표시합니다." : "");
+    }).catch(() => { if (!metadataController.signal.aborted) { setCharacters([]); setMetadataNotice("실험체 목록을 불러오지 못했습니다. 코드로 직접 선택할 수 있습니다."); } });
     const params = new URLSearchParams(window.location.search);
     if (!params.has("nickname")) params.set("nickname", "데모플레이어");
     if (!params.has("startDate")) params.set("startDate", quickPeriod(30).startDate);
@@ -88,6 +104,7 @@ export default function Home() {
       setNickname(search.nickname); setStartDate(search.startDate); setEndDate(search.endDate); setMode(search.mode); setSelected(search.characterCodes); setPageSize(search.pageSize);
       void loadStats(search);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "공유 링크의 검색 조건이 올바르지 않습니다."); }
+    return () => { ++requestSeq.current; metadataController.abort(); statsController.current?.abort(); };
   }, []);
 
   useEffect(() => {
@@ -164,12 +181,13 @@ export default function Home() {
       {draftDiffers && <p className="draft-notice">입력 조건이 현재 결과와 다릅니다. 새 조건은 전적 분석하기를 눌러 적용하세요.</p>}
       <SearchCollections recent={recent} saved={saved} names={names} onRestore={restoreConditions} onRemove={removeCondition} onClearRecent={clearRecent} onClearSaved={clearSaved} onSave={saveDraft} status={collectionStatus}/>
     </section>
-    <div aria-live="polite" aria-atomic="true">{loading && <div className="loading-panel" role="status"><span className="loader"/> 전적을 분석하고 있어요...</div>}{error && <div className="error-panel" role="alert"><strong>전적을 불러오지 못했어요.</strong><span>{error}</span></div>}</div>
+    {metadataNotice && <p role="status" className="section-explainer">{metadataNotice}</p>}
+    <div aria-live="polite" aria-atomic="true">{loading && <div className="loading-panel" role="status"><span className="loader"/> 전적을 분석하고 있어요...</div>}{error && <div className="error-panel" role="alert"><strong>전적을 불러오지 못했어요.</strong><span>{error}</span>{retryAt && <span>재시도 가능 시각: {new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", dateStyle: "short", timeStyle: "medium" }).format(new Date(retryAt))} (KST)</span>}</div>}</div>
     {data && <>
       <section className="results-head"><div><span className="section-kicker">PERFORMANCE OVERVIEW</span><h2>{data.player.nickname}님의 전적</h2><p>{active?.startDate} — {active?.endDate} · {displayMode(active?.mode ?? "all")}</p></div><div className="results-actions"><span className={`source-badge ${data.source}`}>{data.source === "demo" ? "DEMO DATA" : `LIVE API · ${data.coverage.lastSyncedAt ? new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(data.coverage.lastSyncedAt)) : "수집 전"}`}</span><button type="button" className="share-button" onClick={() => void copyShareLink()}>조회 조건 링크 복사</button></div></section>
       {(shareStatus || shareFallback) && <div className="share-feedback" role="status"><span>{shareStatus}</span>{shareFallback && <div className="share-fallback"><input aria-label="복사할 조회 조건 링크" readOnly value={shareFallback} onFocus={event => event.currentTarget.select()} onClick={event => event.currentTarget.select()}/></div>}</div>}
-      <div className={`coverage-note ${data.source}`}><span className="coverage-icon">{data.source === "demo" ? "◈" : "ⓘ"}</span><span><strong>{data.source === "demo" ? "데모 데이터 · 실제 전적이 아닙니다" : "실제 API · 수집 범위가 일부일 수 있습니다"}</strong><br/>{data.coverage.warnings.map(warning => warning.message).join(" ")}{data.source === "live" && <><br/>보관된 게임 시각: {data.coverage.observedFrom ? data.coverage.observedFrom.slice(0, 10) : "없음"} ~ {data.coverage.observedTo ? data.coverage.observedTo.slice(0, 10) : "없음"} (UTC)</>}</span></div>
-      <section className="metric-grid" aria-label="전적 요약"><article className="metric-card primary"><span className="metric-label">TOTAL MATCHES</span><strong>{fmt(data.summary.games)}</strong><span className="metric-detail">선택한 기간의 게임</span><span className="metric-accent">↗</span></article><article className="metric-card"><span className="metric-label">WIN RATE</span><strong>{pct(data.summary.winRate)}</strong><span className="metric-detail">{fmt(data.summary.wins)}승 · 순위 표본 {data.summary.metricCounts.rank}경기</span><div className="metric-bar"><span style={{ width: `${Math.min(data.summary.winRate ?? 0, 100)}%` }}/></div></article><article className="metric-card"><span className="metric-label">AVG. RANK</span><strong>{avg(data.summary.averageRank)}<small>{data.summary.averageRank === null ? "" : "위"}</small></strong><span className="metric-detail">평균 최종 순위</span></article><article className="metric-card"><span className="metric-label">AVG. KILLS</span><strong>{avg(data.summary.averageKills)}</strong><span className="metric-detail">게임당 평균 킬</span></article><article className="metric-card"><span className="metric-label">AVG. ASSISTS</span><strong>{avg(data.summary.averageAssists)}</strong><span className="metric-detail">게임당 평균 어시스트</span></article><article className="metric-card"><span className="metric-label">AVG. DAMAGE</span><strong>{fmt(data.summary.averageDamage === null ? null : Math.round(data.summary.averageDamage))}</strong><span className="metric-detail">게임당 플레이어 피해량</span></article></section>
+      <div className={`coverage-note ${data.source}`}><span className="coverage-icon">{data.source === "demo" ? "◈" : "ⓘ"}</span><span><strong>{data.source === "demo" ? "데모 데이터 · 실제 전적이 아닙니다" : "실제 API · 수집 범위가 일부일 수 있습니다"}</strong><br/>{data.coverage.warnings.map(warning => warning.message).join(" ")}{data.coverage.retryAt && <><br/>재시도 가능 시각: {new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", dateStyle: "short", timeStyle: "medium" }).format(new Date(data.coverage.retryAt))} (KST)</>}{data.source === "live" && <><br/>보관된 게임 시각: {data.coverage.observedFrom ? data.coverage.observedFrom.slice(0, 10) : "없음"} ~ {data.coverage.observedTo ? data.coverage.observedTo.slice(0, 10) : "없음"} (UTC)</>}</span></div>
+      <section className="metric-grid" aria-label="전적 요약"><article className="metric-card primary"><span className="metric-label">TOTAL MATCHES</span><strong>{fmt(data.summary.games)}</strong><span className="metric-detail">선택한 기간의 게임</span><span className="metric-accent">↗</span></article><article className="metric-card"><span className="metric-label">WIN RATE</span><strong>{pct(data.summary.winRate)}</strong><span className="metric-detail">{fmt(data.summary.wins)}승 · 순위 표본 {data.summary.metricCounts.rank}경기</span><div className="metric-bar"><span style={{ width: `${Math.min(data.summary.winRate ?? 0, 100)}%` }}/></div></article><article className="metric-card"><span className="metric-label">AVG. RANK</span><strong>{avg(data.summary.averageRank)}<small>{data.summary.averageRank === null ? "" : "위"}</small></strong><span className="metric-detail">평균 최종 순위 · 표본 {data.summary.metricCounts.rank}경기</span></article><article className="metric-card"><span className="metric-label">AVG. KILLS</span><strong>{avg(data.summary.averageKills)}</strong><span className="metric-detail">게임당 평균 킬 · 표본 {data.summary.metricCounts.kills}경기</span></article><article className="metric-card"><span className="metric-label">AVG. ASSISTS</span><strong>{avg(data.summary.averageAssists)}</strong><span className="metric-detail">게임당 평균 어시스트 · 표본 {data.summary.metricCounts.assists}경기</span></article><article className="metric-card"><span className="metric-label">AVG. DAMAGE</span><strong>{fmt(data.summary.averageDamage === null ? null : Math.round(data.summary.averageDamage))}</strong><span className="metric-detail">게임당 플레이어 피해량 · 표본 {data.summary.metricCounts.damage}경기</span></article></section>
       <TrendCharts trend={data.trend} startDate={data.filters.startDate} endDate={data.filters.endDate} selectedCharacterCount={data.filters.characterCodes.length}/>
       <CharacterComparison rows={data.characters} selectedCount={data.filters.characterCodes.length}/>
       <MatchHistory matches={data.matches} pagination={data.pagination} loading={loading} onPage={page => { if (pageSearch) void loadStats({ ...pageSearch, page }, true); }} onPageSize={size => { setPageSize(size); if (pageSearch) void loadStats({ ...pageSearch, page: 1, pageSize: size }, true); }}/>
